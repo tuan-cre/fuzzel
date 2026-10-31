@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# fuzzel-upscale — Dolphin right-click upscaler via waifu2x-ncnn-vulkan (Vulkan, instant menu)
+# Usage: select image(s) → Right-click → Upscale → pick preset → outputs *_2x.png beside original
+set -euo pipefail
+
+notify() { notify-send "Upscale" "$1" -i video-display 2>/dev/null || true; }
+err_notify() { notify-send "Upscale" "$1" -i dialog-error 2>/dev/null || true; }
+
+run_timeout() {
+  local dur="$1"; shift
+  if command -v timeout &>/dev/null; then timeout "$dur" "$@" 2>/dev/null
+  else "$@" 2>/dev/null; fi
+}
+
+if ! command -v waifu2x-ncnn-vulkan &>/dev/null; then err_notify "waifu2x-ncnn-vulkan not found. sudo pacman -S waifu2x-ncnn-vulkan"; exit 0; fi
+if ! command -v fuzzel &>/dev/null; then err_notify "fuzzel not found."; exit 0; fi
+
+# --- 1. Gather files ---
+files=()
+if [[ $# -gt 0 ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == file://* ]]; then
+      p="${arg#file://}"; [[ "$p" == localhost/* ]] && p="${p#localhost}"
+      p=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$p" 2>/dev/null || echo "$p")
+      [[ -f "$p" ]] && files+=("$p")
+    elif [[ -f "$arg" ]]; then files+=("$arg"); fi
+  done
+else
+  CLIP_TIMEOUT=1.5; QDBUS_TIMEOUT=1.5; uri_data=""
+  if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  else uri_data=""; fi
+  parse_uri_data() {
+    local data="$1"; local parsed=1
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" == "copy" || "$line" == "cut" ]] && continue
+      [[ "$line" == *"Nothing is copied"* ]] && continue
+      if [[ "$line" == file://* ]]; then
+        path="${line#file://}"; [[ "$path" == localhost/* ]] && path="${path#localhost}"
+        decoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
+        [[ -f "$decoded" ]] && files+=("$decoded") && parsed=0
+      else [[ -f "$line" ]] && files+=("$line") && parsed=0; fi
+    done <<< "$data"; return $parsed
+  }
+  if [[ -n "$uri_data" ]]; then tmp_files=("${files[@]}"); if parse_uri_data "$uri_data"; then :; else files=("${tmp_files[@]}"); uri_data=""; fi; fi
+  if [[ ${#files[@]} -eq 0 ]]; then
+    dolphin_service=""
+    if command -v qdbus6 &>/dev/null; then
+      for svc in $(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep '^org.kde.dolphin-' || true); do
+        if run_timeout "$QDBUS_TIMEOUT" qdbus6 "$svc" /dolphin/Dolphin_1 org.kde.dolphin.MainWindow.isActiveWindow 2>/dev/null | grep -q "true"; then dolphin_service="$svc"; break; fi
+      done
+      [[ -z "$dolphin_service" ]] && dolphin_service=$(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep -m1 '^org.kde.dolphin-' || true)
+    fi
+    if [[ -n "$dolphin_service" ]]; then
+      run_timeout "$QDBUS_TIMEOUT" qdbus6 "$dolphin_service" /dolphin/Dolphin_1 org.kde.KMainWindow.activateAction edit_copy >/dev/null 2>&1 || true
+      sleep 0.4
+      for _ in 1 2 3; do
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        else uri_data=""; fi
+        if [[ -n "$uri_data" ]] && parse_uri_data "$uri_data"; then break; fi
+        sleep 0.2
+      done
+    fi
+    if [[ ${#files[@]} -eq 0 ]] && command -v ydotool &>/dev/null && [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]]; then
+      if command -v hyprctl &>/dev/null && hyprctl activewindow -j 2>/dev/null | grep -q '"class": "dolphin"'; then
+        run_timeout 1 ydotool key 29:1 46:1 46:0 29:0 >/dev/null 2>&1 || true; sleep 0.4
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        else uri_data=""; fi
+        [[ -n "$uri_data" ]] && parse_uri_data "$uri_data" || true
+      fi
+    fi
+  fi
+fi
+
+if [[ ${#files[@]} -eq 0 ]]; then err_notify "No images selected."; exit 0; fi
+declare -A seen; uniq_files=(); for f in "${files[@]}"; do [[ -z "${seen["$f"]:-}" ]] && seen["$f"]=1 && uniq_files+=("$f"); done; files=("${uniq_files[@]}")
+MAX_FILES=20; MAX_SIZE_MB=50
+if [[ ${#files[@]} -gt $MAX_FILES ]]; then err_notify "Too many files (${#files[@]} > $MAX_FILES)"; exit 0; fi
+filtered=(); skipped=()
+for f in "${files[@]}"; do
+  [[ -f "$f" ]] || { skipped+=("$(basename "$f"): not file"); continue; }
+  size_mb=$(stat -c%s "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)" "$size_mb" "$MAX_SIZE_MB" 2>/dev/null; then skipped+=("$(basename "$f"): >${MAX_SIZE_MB}MB"); continue; fi
+  mtype=$(file --mime-type -b "$f" 2>/dev/null || echo unknown)
+  case "$mtype" in image/*) ;; *) skipped+=("$(basename "$f"): $mtype"); continue ;; esac
+  filtered+=("$f")
+done
+[[ ${#skipped[@]} -gt 0 ]] && notify "Skipped ${#skipped[@]}: ${skipped[0]}"
+files=("${filtered[@]}")
+[[ ${#files[@]} -eq 0 ]] && err_notify "No valid images." && exit 0
+
+# --- 2. Pick preset via fuzzel (instant) ---
+# waifu2x: -m model, -n noise -1..3, -s scale 1/2, -t tile
+presets=(
+  "2x no-denoise — cunet (default, photo)"
+  "2x denoise 1 — cunet (light denoise)"
+  "2x denoise 2 — cunet (strong)"
+  "2x anime — upconv_7_anime_style_art_rgb"
+  "2x photo — upconv_7_photo"
+  "2x tta — cunet + tta (slow, better)"
+  "4x no-denoise — cunet (slow, 16x pixels)"
+  "4x anime — upconv_7_anime_style_art_rgb"
+  "4x photo — upconv_7_photo"
+)
+count=${#files[@]}
+if [[ $count -eq 1 ]]; then prompt="Upscale $(basename "${files[0]}") > "
+else prompt="Upscale $count images > "; fi
+
+if ! flock -n "/tmp/fuzzel-upscale.lock" true 2>/dev/null; then notify "Upscale already running"; exit 0; fi
+
+chosen=$(printf '%s\n' "${presets[@]}" | fuzzel --dmenu --prompt="$prompt" --lines=8 --placeholder=" Pick preset " 2>/dev/null || true)
+[[ -z "${chosen:-}" ]] && exit 0
+
+# parse preset - use absolute model paths (relative fails when run from Dolphin, looks in /usr/bin)
+case "$chosen" in
+  "2x no-denoise — cunet"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=0; SCALE=2; TTA="" ;;
+  "2x denoise 1 — cunet"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=1; SCALE=2; TTA="" ;;
+  "2x denoise 2 — cunet"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=2; SCALE=2; TTA="" ;;
+  "2x anime — upconv_7_anime_style_art_rgb"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-upconv_7_anime_style_art_rgb"; NOISE=0; SCALE=2; TTA="" ;;
+  "2x photo — upconv_7_photo"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-upconv_7_photo"; NOISE=0; SCALE=2; TTA="" ;;
+  "2x tta — cunet"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=0; SCALE=2; TTA="-x" ;;
+  "4x no-denoise — cunet"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=0; SCALE=4; TTA="" ;;
+  "4x anime — upconv_7_anime_style_art_rgb"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-upconv_7_anime_style_art_rgb"; NOISE=0; SCALE=4; TTA="" ;;
+  "4x photo — upconv_7_photo"*) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-upconv_7_photo"; NOISE=0; SCALE=4; TTA="" ;;
+  *) MODEL="/usr/share/waifu2x-ncnn-vulkan/models-cunet"; NOISE=0; SCALE=2; TTA="" ;;
+esac
+
+# --- 3. Run in background so menu returns instantly ---
+BG_FILES=("${files[@]}")
+BG_MODEL="$MODEL"; BG_NOISE="$NOISE"; BG_SCALE="$SCALE"; BG_TTA="$TTA"
+(
+  LOCKFILE="/tmp/fuzzel-upscale.lock"
+  exec 200>"$LOCKFILE"
+  if ! flock -n 200; then notify "Upscale already running"; exit 0; fi
+  success=0; fail=0; failed=(); converted=()
+  CONVERT_TIMEOUT=120
+  for src in "${BG_FILES[@]}"; do
+    dir=$(dirname -- "$src"); base=$(basename -- "$src"); name="${base%.*}"
+    [[ "$base" == "$name" ]] && name="$base"; [[ -z "$name" ]] && name="$base"
+    # output always png for quality, unless input is jpg keep jpg? use png
+    out="$dir/${name}_${BG_SCALE}x.png"
+    if [[ -e "$out" ]]; then i=1; while [[ -e "$dir/${name}_${BG_SCALE}x_$i.png" ]]; do i=$((i+1)); [[ $i -gt 100 ]] && break; done; out="$dir/${name}_${BG_SCALE}x_$i.png"; fi
+    notify "Upscaling: $(basename "$src") → $(basename "$out") ($BG_MODEL)…"
+    # waifu2x uses Vulkan auto (gpu 0), -t 400 for 6GB
+    CMD=(waifu2x-ncnn-vulkan -i "$src" -o "$out" -m "$BG_MODEL" -n "$BG_NOISE" -s "$BG_SCALE" -t 400 -g 0 -j 1:2:2)
+    if [[ -n "$BG_TTA" ]]; then CMD+=(-x); fi
+    ERRFILE=$(mktemp /tmp/fuzzel-upscale.XXXXXX.err)
+    if timeout "$CONVERT_TIMEOUT" "${CMD[@]}" 2>"$ERRFILE"; then
+      if [[ -s "$out" ]]; then success=$((success+1)); converted+=("$out")
+      else fail=$((fail+1)); failed+=("$(basename "$src") → empty"); rm -f "$out" 2>/dev/null || true; fi
+    else
+      ec=$?; err=$(head -n 3 "$ERRFILE" 2>/dev/null | tr -d '\n' | cut -c1-120); [[ -z "$err" ]] && err="failed $ec"
+      if [[ $ec -eq 124 ]]; then err="timed out ${CONVERT_TIMEOUT}s"; fi
+      fail=$((fail+1)); failed+=("$(basename "$src") → $err"); rm -f "$out" 2>/dev/null || true
+    fi
+    rm -f "$ERRFILE"
+  done
+  if [[ $success -gt 0 && $fail -eq 0 ]]; then
+    if [[ $success -eq 1 ]]; then notify "✓ Upscaled: $(basename "${converted[0]}")"
+    else notify "✓ Upscaled $success images ${BG_SCALE}x ($BG_MODEL)"; fi
+  elif [[ $success -gt 0 && $fail -gt 0 ]]; then notify "Upscaled $success ok, $fail failed"; err_notify "${failed[0]}"
+  elif [[ $fail -gt 0 ]]; then err_notify "Upscale failed ($fail): ${failed[0]}"; fi
+) & disown
+exit 0

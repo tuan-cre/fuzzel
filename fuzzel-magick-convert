@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# fuzzel-magick-convert — safe Dolphin → magick converter
+# Usage: select file(s) in Dolphin, press Super+G
+#        Or: fuzzel-magick-convert /path/to/file ...
+# Safety: timeouts on all blocking calls, input validation, per-run tempfiles,
+#         no second blocking fuzzel, allowlist, size limits.
+
+set -euo pipefail
+
+# --- helpers ---
+notify() { notify-send "Magick Convert" "$1" -i image-x-generic 2>/dev/null || true; }
+err_notify() { notify-send "Magick Convert" "$1" -i dialog-error 2>/dev/null || true; }
+
+ERRFILE=$(mktemp /tmp/fuzzel-magick-convert.XXXXXX.err)
+trap 'rm -f "$ERRFILE"' EXIT INT TERM
+
+# timeout wrapper - use GNU timeout if available
+run_timeout() {
+  local dur="$1"; shift
+  if command -v timeout &>/dev/null; then
+    timeout "$dur" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# checks
+if ! command -v magick &>/dev/null; then
+  err_notify "magick not found. Install imagemagick."
+  exit 0
+fi
+if ! command -v fuzzel &>/dev/null; then
+  err_notify "fuzzel not found."
+  exit 0
+fi
+
+# --- config ---
+MAX_FILES=50
+MAX_FILE_SIZE_MB=200
+CONVERT_TIMEOUT=45
+CLIP_TIMEOUT=1.5
+QDBUS_TIMEOUT=1.5
+ALLOWED_EXTS=("png" "jpg" "jpeg" "webp" "avif" "heic" "bmp" "tiff" "tif" "gif" "pdf" "ico" "ppm" "jxl")
+
+is_allowed_ext() {
+  local e="$1"
+  for a in "${ALLOWED_EXTS[@]}"; do [[ "$e" == "$a" ]] && return 0; done
+  return 1
+}
+
+# --- 1. Gather files ---
+files=()
+
+if [[ $# -gt 0 ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == file://* ]]; then
+      p="${arg#file://}"
+      [[ "$p" == localhost/* ]] && p="${p#localhost}"
+      p=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$p" 2>/dev/null || echo "$p")
+      [[ -f "$p" ]] && files+=("$p")
+    elif [[ -f "$arg" ]]; then
+      files+=("$arg")
+    fi
+  done
+else
+  # 1a: try clipboard first WITHOUT overwriting (non-destructive)
+  uri_data=""
+  # try wl-paste with timeout - don't block forever
+  if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+    :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+    :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+    :
+  else
+    uri_data=""
+  fi
+
+  # helper to parse uri_data into files - returns 0 if at least one file found
+  parse_uri_data() {
+    local data="$1"
+    local parsed=1
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" == "copy" || "$line" == "cut" ]] && continue
+      [[ "$line" == *"Nothing is copied"* ]] && continue
+      if [[ "$line" == file://* ]]; then
+        path="${line#file://}"
+        [[ "$path" == localhost/* ]] && path="${path#localhost}"
+        decoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
+        if [[ -f "$decoded" ]]; then
+          files+=("$decoded")
+          parsed=0
+        fi
+      else
+        if [[ -f "$line" ]]; then
+          files+=("$line")
+          parsed=0
+        fi
+      fi
+    done <<< "$data"
+    return $parsed
+  }
+
+  # if clipboard already had files, use it
+  if [[ -n "$uri_data" ]]; then
+    tmp_files=("${files[@]}")
+    if parse_uri_data "$uri_data"; then
+      # success - keep files
+      :
+    else
+      # no valid files in clipboard, clear and try dolphin copy
+      files=("${tmp_files[@]}")
+      uri_data=""
+    fi
+  fi
+
+  # 1b: if still no files, try to trigger Dolphin copy (only now we overwrite clipboard)
+  if [[ ${#files[@]} -eq 0 ]]; then
+    # find active Dolphin service if possible
+    dolphin_service=""
+    if command -v qdbus6 &>/dev/null; then
+      # prefer active window
+      for svc in $(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep '^org.kde.dolphin-' || true); do
+        if run_timeout "$QDBUS_TIMEOUT" qdbus6 "$svc" /dolphin/Dolphin_1 org.kde.dolphin.MainWindow.isActiveWindow 2>/dev/null | grep -q "true"; then
+          dolphin_service="$svc"
+          break
+        fi
+      done
+      # fallback to first if none active
+      if [[ -z "$dolphin_service" ]]; then
+        dolphin_service=$(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep -m1 '^org.kde.dolphin-' || true)
+      fi
+    fi
+    if [[ -n "$dolphin_service" ]]; then
+      run_timeout "$QDBUS_TIMEOUT" qdbus6 "$dolphin_service" /dolphin/Dolphin_1 org.kde.KMainWindow.activateAction edit_copy >/dev/null 2>&1 || true
+      sleep 0.6
+      # re-read clipboard with timeout - poll 3 times
+      for _ in 1 2 3; do
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        else
+          uri_data=""
+        fi
+        if [[ -n "$uri_data" ]]; then
+          if parse_uri_data "$uri_data"; then
+            break
+          fi
+        fi
+        sleep 0.2
+      done
+    fi
+    # fallback ydotool if still no files and Dolphin is active
+    if [[ ${#files[@]} -eq 0 ]] && command -v ydotool &>/dev/null && [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]]; then
+      # only send Ctrl+C if active window is Dolphin
+      if command -v hyprctl &>/dev/null && hyprctl activewindow -j 2>/dev/null | grep -q '"class": "dolphin"'; then
+        run_timeout 1 ydotool key 29:1 46:1 46:0 29:0 >/dev/null 2>&1 || true
+        sleep 0.6
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then
+          :
+        else
+          uri_data=""
+        fi
+        if [[ -n "$uri_data" ]]; then
+          parse_uri_data "$uri_data" || true
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  err_notify "No files selected. Select file(s) in Dolphin then press Super+G."
+  exit 0
+fi
+
+# De-duplicate while preserving order
+declare -A seen
+uniq_files=()
+for f in "${files[@]}"; do
+  if [[ -z "${seen["$f"]:-}" ]]; then
+    seen["$f"]=1
+    uniq_files+=("$f")
+  fi
+done
+files=("${uniq_files[@]}")
+
+# Safety: limit number of files
+if [[ ${#files[@]} -gt $MAX_FILES ]]; then
+  err_notify "Too many files selected (${#files[@]} > $MAX_FILES). Select fewer."
+  exit 0
+fi
+
+# Safety: filter out non-regular files, huge files, non-images (warn but allow)
+filtered=()
+skipped=()
+for f in "${files[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    skipped+=("$(basename "$f"): not a regular file")
+    continue
+  fi
+  if [[ -L "$f" && ! -f "$(readlink -f "$f" 2>/dev/null || echo "$f")" ]]; then
+    skipped+=("$(basename "$f"): broken symlink")
+    continue
+  fi
+  # size check
+  size_mb=$(stat -c%s "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+  # awk may output float, compare via python or bc
+  if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)" "$size_mb" "$MAX_FILE_SIZE_MB" 2>/dev/null; then
+    :
+  else
+    skipped+=("$(basename "$f"): >${MAX_FILE_SIZE_MB}MB, skipped")
+    continue
+  fi
+  # optional mime check - warn if not image/pdf but still allow conversion attempt
+  # we skip only if it's clearly not convertible (e.g. text, binary without image header)
+  # use 'file --mime-type'
+  mtype=$(file --mime-type -b "$f" 2>/dev/null || echo "unknown")
+  case "$mtype" in
+    image/*|application/pdf|application/postscript) ;;
+    *)
+      # allow but note - magick may still handle some types like svg
+      if [[ "$f" == *.svg || "$f" == *.psd || "$f" == *.xcf ]]; then
+        :
+      else
+        # check if magick identify can read it quickly (timeout 3s)
+        if ! run_timeout 3 magick identify "$f" >/dev/null 2>&1; then
+          skipped+=("$(basename "$f"): unsupported type ($mtype)")
+          continue
+        fi
+      fi
+      ;;
+  esac
+  filtered+=("$f")
+done
+
+if [[ ${#filtered[@]} -eq 0 ]]; then
+  msg="No convertible files. Skipped: ${skipped[*]:-unknown}"
+  err_notify "$msg"
+  exit 0
+fi
+if [[ ${#skipped[@]} -gt 0 ]]; then
+  notify "Skipped ${#skipped[@]} file(s): ${skipped[0]}"
+fi
+files=("${filtered[@]}")
+
+# --- 2. Pick target format via fuzzel ---
+formats=(
+  "png   — PNG (lossless)"
+  "jpg   — JPEG (lossy)"
+  "jpeg  — JPEG (alias)"
+  "webp  — WebP (modern)"
+  "avif  — AVIF (modern)"
+  "heic  — HEIC (Apple)"
+  "bmp   — BMP (bitmap)"
+  "tiff  — TIFF (high-quality)"
+  "tif   — TIFF (alias)"
+  "gif   — GIF (256 colors)"
+  "pdf   — PDF (document)"
+  "ico   — ICO (icon)"
+  "ppm   — PPM (portable pixmap)"
+  "jxl   — JPEG XL"
+)
+
+count=${#files[@]}
+if [[ $count -eq 1 ]]; then
+  prompt="Convert $(basename "${files[0]}") to > "
+else
+  prompt="Convert $count files to > "
+fi
+
+# quick lock check before showing menu (instant)
+if ! flock -n "/tmp/fuzzel-magick-convert.lock" true 2>/dev/null; then
+  notify "Magick Convert already running — wait"
+  exit 0
+fi
+
+# fuzzel with timeout? No timeout for user interaction, but ensure we exit cleanly on cancel
+chosen=$(printf '%s\n' "${formats[@]}" | fuzzel --dmenu --prompt="$prompt" --lines=14 --placeholder=" Pick format " 2>/dev/null || true)
+# fuzzel returns non-zero on cancel - treat as exit
+if [[ -z "${chosen:-}" ]]; then
+  exit 0
+fi
+
+target_ext=$(awk '{print $1}' <<< "$chosen" | tr '[:upper:]' '[:lower:]')
+if [[ -z "$target_ext" ]]; then
+  exit 0
+fi
+
+if ! is_allowed_ext "$target_ext"; then
+  err_notify "Unsupported format: $target_ext"
+  exit 0
+fi
+
+# --- 3. Convert each file in background so menu returns instantly ---
+BG_FILES=("${files[@]}")
+BG_EXT="$target_ext"
+(
+  LOCKFILE="/tmp/fuzzel-magick-convert.lock"
+  exec 200>"$LOCKFILE"
+  if ! flock -n 200; then notify "Magick Convert already running"; exit 0; fi
+  ERRFILE=$(mktemp /tmp/fuzzel-magick-convert.XXXXXX.err)
+  trap 'rm -f "$ERRFILE"' EXIT
+  success=0; fail=0; failed_files=(); converted_files=()
+  for src in "${BG_FILES[@]}"; do
+    if [[ ! -f "$src" ]]; then fail=$((fail+1)); failed_files+=("$(basename "$src") (not found)"); continue; fi
+    dir=$(dirname -- "$src"); base=$(basename -- "$src"); name="${base%.*}"
+    if [[ "$base" == "$name" ]]; then name="$base"; fi; [[ -z "$name" ]] && name="$base"
+    out="$dir/$name.$BG_EXT"
+    if [[ "$out" == "$src" ]]; then out="$dir/${name}_converted.$BG_EXT"; fi
+    if [[ -e "$out" ]]; then i=1; while [[ -e "$dir/${name}_$i.$BG_EXT" ]]; do i=$((i+1)); [[ $i -gt 100 ]] && break; done; out="$dir/${name}_$i.$BG_EXT"; fi
+    if timeout "$CONVERT_TIMEOUT" magick -limit memory 1GiB -limit disk 2GiB "$src" "$out" 2>"$ERRFILE"; then
+      if [[ -s "$out" ]]; then success=$((success+1)); converted_files+=("$out")
+      else fail=$((fail+1)); failed_files+=("$(basename "$src") → empty output"); rm -f "$out" 2>/dev/null || true; fi
+    else
+      ec=$?; fail=$((fail+1))
+      if [[ $ec -eq 124 ]]; then err="timed out after ${CONVERT_TIMEOUT}s"
+      else err=$(head -n 2 "$ERRFILE" 2>/dev/null | tr -d '\n' | cut -c1-120); [[ -z "$err" ]] && err="magick failed (code $ec)"; fi
+      failed_files+=("$(basename "$src") → $err"); rm -f "$out" 2>/dev/null || true
+    fi
+  done
+  if [[ $success -gt 0 && $fail -eq 0 ]]; then
+    if [[ $success -eq 1 ]]; then notify "✓ Converted to $BG_EXT: $(basename "${converted_files[0]}")"
+    else notify "✓ Converted $success file(s) to $BG_EXT"; fi
+  elif [[ $success -gt 0 && $fail -gt 0 ]]; then notify "Converted $success file(s) to $BG_EXT, $fail failed"; err_notify "Failed: ${failed_files[0]}"
+  elif [[ $fail -gt 0 ]]; then err_notify "Conversion failed ($fail): ${failed_files[0]}"; fi
+) & disown
+exit 0

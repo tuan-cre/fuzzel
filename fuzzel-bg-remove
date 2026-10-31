@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# fuzzel-bg-remove — Dolphin right-click bg-remover via rembg (local, instant menu)
+# Picks model via fuzzel instantly, then runs rembg in background
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/pipx/venvs/rembg/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+REMBG_BIN="$(command -v rembg 2>/dev/null || echo "$HOME/.local/bin/rembg")"
+
+notify() { notify-send "BG Remove" "$1" -i edit-cut 2>/dev/null || true; }
+err_notify() { notify-send "BG Remove" "$1" -i dialog-error 2>/dev/null || true; }
+
+run_timeout() {
+  local dur="$1"; shift
+  if command -v timeout &>/dev/null; then timeout "$dur" "$@" 2>/dev/null
+  else "$@" 2>/dev/null; fi
+}
+
+# fast checks only (no python import)
+if ! command -v "$REMBG_BIN" &>/dev/null && ! [[ -x "$REMBG_BIN" ]] && ! [[ -x "$HOME/.local/bin/rembg" ]]; then
+  err_notify "rembg not found. pipx install \"rembg[cpu]\" then pipx inject rembg onnxruntime"
+  exit 0
+fi
+[[ -x "$HOME/.local/bin/rembg" ]] && REMBG_BIN="$HOME/.local/bin/rembg"
+if ! command -v fuzzel &>/dev/null; then err_notify "fuzzel not found."; exit 0; fi
+
+# --- 1. Gather files (fast for %F right-click, no heavy checks before fuzzel) ---
+files=()
+if [[ $# -gt 0 ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == file://* ]]; then
+      p="${arg#file://}"; [[ "$p" == localhost/* ]] && p="${p#localhost}"
+      p=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$p" 2>/dev/null || echo "$p")
+      [[ -f "$p" ]] && files+=("$p")
+    elif [[ -f "$arg" ]]; then files+=("$arg"); fi
+  done
+else
+  CLIP_TIMEOUT=1.5; QDBUS_TIMEOUT=1.5; uri_data=""
+  if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+  else uri_data=""; fi
+  parse_uri_data() {
+    local data="$1"; local parsed=1
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" == "copy" || "$line" == "cut" ]] && continue
+      [[ "$line" == *"Nothing is copied"* ]] && continue
+      if [[ "$line" == file://* ]]; then
+        path="${line#file://}"; [[ "$path" == localhost/* ]] && path="${path#localhost}"
+        decoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
+        [[ -f "$decoded" ]] && files+=("$decoded") && parsed=0
+      else [[ -f "$line" ]] && files+=("$line") && parsed=0; fi
+    done <<< "$data"; return $parsed
+  }
+  if [[ -n "$uri_data" ]]; then tmp_files=("${files[@]}"); if parse_uri_data "$uri_data"; then :; else files=("${tmp_files[@]}"); uri_data=""; fi; fi
+  if [[ ${#files[@]} -eq 0 ]]; then
+    dolphin_service=""
+    if command -v qdbus6 &>/dev/null; then
+      for svc in $(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep '^org.kde.dolphin-' || true); do
+        if run_timeout "$QDBUS_TIMEOUT" qdbus6 "$svc" /dolphin/Dolphin_1 org.kde.dolphin.MainWindow.isActiveWindow 2>/dev/null | grep -q "true"; then dolphin_service="$svc"; break; fi
+      done
+      [[ -z "$dolphin_service" ]] && dolphin_service=$(run_timeout "$QDBUS_TIMEOUT" qdbus6 2>/dev/null | grep -m1 '^org.kde.dolphin-' || true)
+    fi
+    if [[ -n "$dolphin_service" ]]; then
+      run_timeout "$QDBUS_TIMEOUT" qdbus6 "$dolphin_service" /dolphin/Dolphin_1 org.kde.KMainWindow.activateAction edit_copy >/dev/null 2>&1 || true
+      sleep 0.4
+      for _ in 1 2 3; do
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        else uri_data=""; fi
+        if [[ -n "$uri_data" ]] && parse_uri_data "$uri_data"; then break; fi
+        sleep 0.2
+      done
+    fi
+    if [[ ${#files[@]} -eq 0 ]] && command -v ydotool &>/dev/null && [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]]; then
+      if command -v hyprctl &>/dev/null && hyprctl activewindow -j 2>/dev/null | grep -q '"class": "dolphin"'; then
+        run_timeout 1 ydotool key 29:1 46:1 46:0 29:0 >/dev/null 2>&1 || true; sleep 0.4
+        uri_data=""
+        if uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type text/uri-list 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste --type x-special/gnome-copied-files 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        elif uri_data=$(run_timeout "$CLIP_TIMEOUT" wl-paste 2>/dev/null) && [[ -n "$uri_data" && "$uri_data" != *"Nothing is copied"* ]]; then :
+        else uri_data=""; fi
+        [[ -n "$uri_data" ]] && parse_uri_data "$uri_data" || true
+      fi
+    fi
+  fi
+fi
+
+if [[ ${#files[@]} -eq 0 ]]; then err_notify "No images selected."; exit 0; fi
+declare -A seen; uniq_files=(); for f in "${files[@]}"; do [[ -z "${seen["$f"]:-}" ]] && seen["$f"]=1 && uniq_files+=("$f"); done; files=("${uniq_files[@]}")
+MAX_FILES=20; MAX_SIZE_MB=50
+if [[ ${#files[@]} -gt $MAX_FILES ]]; then err_notify "Too many files (${#files[@]} > $MAX_FILES)"; exit 0; fi
+filtered=(); skipped=()
+for f in "${files[@]}"; do
+  [[ -f "$f" ]] || { skipped+=("$(basename "$f"): not file"); continue; }
+  size_mb=$(stat -c%s "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)" "$size_mb" "$MAX_SIZE_MB" 2>/dev/null; then skipped+=("$(basename "$f"): >${MAX_SIZE_MB}MB"); continue; fi
+  mtype=$(file --mime-type -b "$f" 2>/dev/null || echo unknown)
+  case "$mtype" in image/*) ;; *) skipped+=("$(basename "$f"): $mtype"); continue ;; esac
+  filtered+=("$f")
+done
+[[ ${#skipped[@]} -gt 0 ]] && notify "Skipped ${#skipped[@]}: ${skipped[0]}"
+files=("${filtered[@]}")
+[[ ${#files[@]} -eq 0 ]] && err_notify "No valid images." && exit 0
+
+# --- 2. Pick model via fuzzel (instant, no heavy work before) ---
+models=(
+  "isnet-general-use — General (recommended)"
+  "birefnet-general — Best quality (~200MB)"
+  "u2net — Classic fast (small)"
+  "birefnet-general-lite — Fast birefnet"
+  "isnet-anime — Anime"
+  "u2net_human_seg — Human only"
+)
+count=${#files[@]}
+if [[ $count -eq 1 ]]; then prompt="BG Remove $(basename "${files[0]}") > "
+else prompt="BG Remove $count images > "; fi
+
+# quick lock check before showing menu (instant, no heavy work)
+if ! flock -n "/tmp/fuzzel-bg-remove.lock" true 2>/dev/null; then
+  notify "BG Remove already running — wait"
+  exit 0
+fi
+
+chosen=$(printf '%s\n' "${models[@]}" | fuzzel --dmenu --prompt="$prompt" --lines=8 --placeholder=" Pick model " 2>/dev/null || true)
+[[ -z "${chosen:-}" ]] && exit 0
+model=$(awk '{print $1}' <<< "$chosen")
+case "$model" in isnet-general-use|birefnet-general|birefnet-general-lite|u2net|isnet-anime|u2net_human_seg) ;; *) model="isnet-general-use" ;; esac
+
+# --- 3. Run conversions in background so menu returns instantly ---
+# capture files for background
+BG_FILES=("${files[@]}")
+BG_MODEL="$model"
+BG_REMBG="$REMBG_BIN"
+(
+  LOCKFILE="/tmp/fuzzel-bg-remove.lock"
+  exec 200>"$LOCKFILE"
+  if ! flock -n 200; then notify "BG Remove already running"; exit 0; fi
+  ERRFILE=$(mktemp /tmp/fuzzel-bg-remove.XXXXXX.err)
+  trap 'rm -f "$ERRFILE"' EXIT
+  # only notify if model not cached (real location ~/.rembg/models/)
+  if [[ ! -f "$HOME/.rembg/models/$BG_MODEL/${BG_MODEL}.onnx" && ! -d "$HOME/.rembg/models/$BG_MODEL" ]]; then
+    notify "Downloading $BG_MODEL ~100-200MB first run…"
+  fi
+  success=0; fail=0; failed=(); converted=()
+  CONVERT_TIMEOUT=90
+  for src in "${BG_FILES[@]}"; do
+    dir=$(dirname -- "$src"); base=$(basename -- "$src"); name="${base%.*}"
+    [[ "$base" == "$name" ]] && name="$base"; [[ -z "$name" ]] && name="$base"
+    out="$dir/${name}_nobg.png"
+    if [[ -e "$out" ]]; then i=1; while [[ -e "$dir/${name}_nobg_$i.png" ]]; do i=$((i+1)); [[ $i -gt 100 ]] && break; done; out="$dir/${name}_nobg_$i.png"; fi
+    notify "Removing BG: $(basename "$src") → $(basename "$out") ($BG_MODEL)…"
+    # birefnet* (928M/224M) BFCArena bug on 6GB GPU → default CPU, others GPU
+    if [[ "$BG_MODEL" == birefnet* ]]; then
+      REMBG_CMD=(env CUDA_VISIBLE_DEVICES="" "$BG_REMBG" i -m "$BG_MODEL")
+    else
+      REMBG_CMD=("$BG_REMBG" i -m "$BG_MODEL")
+    fi
+    if timeout "$CONVERT_TIMEOUT" "${REMBG_CMD[@]}" "$src" "$out" 2>"$ERRFILE"; then
+      if [[ -s "$out" ]]; then success=$((success+1)); converted+=("$out")
+      else fail=$((fail+1)); failed+=("$(basename "$src") → empty"); rm -f "$out" 2>/dev/null || true; fi
+    else
+      ec=$?
+      # fallback to CPU if GPU arena fails for non-birefnet (shouldn't happen for isnet/u2net)
+      if grep -q "BFCArena\|Failed to allocate\|CUDA" "$ERRFILE" 2>/dev/null && [[ "$BG_MODEL" != birefnet* ]]; then
+        notify "GPU failed ($BG_MODEL), retrying on CPU…"
+        if timeout "$CONVERT_TIMEOUT" env CUDA_VISIBLE_DEVICES="" "$BG_REMBG" i -m "$BG_MODEL" "$src" "$out" 2>"$ERRFILE"; then
+          if [[ -s "$out" ]]; then success=$((success+1)); converted+=("$out"); continue
+          else fail=$((fail+1)); failed+=("$(basename "$src") → empty"); rm -f "$out" 2>/dev/null || true; continue; fi
+        else
+          ec=$?; err=$(head -n 2 "$ERRFILE" 2>/dev/null | tr -d '\n' | cut -c1-120); [[ -z "$err" ]] && err="CPU retry failed $ec"
+          fail=$((fail+1)); failed+=("$(basename "$src") → $err"); rm -f "$out" 2>/dev/null || true; continue
+        fi
+      fi
+      err=$(head -n 2 "$ERRFILE" 2>/dev/null | tr -d '\n' | cut -c1-120); [[ -z "$err" ]] && err="failed $ec"
+      if [[ $ec -eq 124 ]]; then err="timed out ${CONVERT_TIMEOUT}s"; fi
+      fail=$((fail+1)); failed+=("$(basename "$src") → $err"); rm -f "$out" 2>/dev/null || true
+    fi
+  done
+  if [[ $success -gt 0 && $fail -eq 0 ]]; then
+    if [[ $success -eq 1 ]]; then notify "✓ BG removed: $(basename "${converted[0]}")"
+    else notify "✓ BG removed $success images ($BG_MODEL)"; fi
+  elif [[ $success -gt 0 && $fail -gt 0 ]]; then notify "BG remove: $success ok, $fail failed"; err_notify "${failed[0]}"
+  elif [[ $fail -gt 0 ]]; then err_notify "BG remove failed ($fail): ${failed[0]}"; fi
+) & disown
+exit 0

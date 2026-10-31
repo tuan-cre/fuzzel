@@ -1,0 +1,11 @@
+[appearance]
+theme = gruvbox
+font = FiraCode Nerd Font 12
+width = 400
+height = 30
+border-radius = 5
+show-icons = true
+
+[keybindings]
+launch = Return
+close = Escape

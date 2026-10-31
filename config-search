@@ -1,0 +1,227 @@
+#!/bin/bash
+# config-search — fuzzel file search with two modes:
+#   (default) config files -> open in kate
+#   --all     all files    -> open with xdg-open
+
+MODE="config"
+[[ "${1:-}" == "--all" ]] && MODE="all"
+
+SEARCH_DIRS=(
+  "$HOME/.config"
+  "$HOME/.local/share"
+  "/etc"
+)
+
+if [[ "$MODE" == "all" ]]; then
+  CACHE="$HOME/.cache/all_files.txt"
+  RECENT="$HOME/.cache/all_recent.txt"
+  OPENER="xdg-open"
+  PROMPT="⌕ All > "
+  MAXDEPTH=6
+  MAXSIZE="-50M"
+else
+  CACHE="$HOME/.cache/config_files.txt"
+  RECENT="$HOME/.cache/config_recent.txt"
+  OPENER="kate"
+  PROMPT="⚙ Config > "
+  MAXDEPTH=8
+  MAXSIZE="-2M"
+fi
+MAX_RECENT=30
+
+build_cache() {
+  local tmp
+  tmp=$(mktemp "${CACHE}.XXXXXX") || return 1
+  if command -v fd &>/dev/null; then
+    : > "$tmp"
+    # Shared excludes: globs (*cache* catches crx_cache/CachedConfigurations),
+    # plus package-manager / game-data stores that dwarfed the cache
+    # (pnpm:22k, pipx:7k, uv:7k, Steam:~7k).
+    local excludes=(
+      -E '.git' -E 'node_modules'
+      -E '__pycache__' -E 'logs'
+      -E '*cache*' -E '*Cache*'
+      -E 'pnpm' -E 'pipx' -E 'uv'
+      -E 'Steam' -E '.steam'
+      -E 'Trash' -E 'baloo'
+      -E '*.lock' -E 'package-lock.json'
+    )
+    # $HOME top-level only (covers ~/.zshrc, ~/.bashrc — NOT in SEARCH_DIRS).
+    # -d 1 so ~/Projects etc. are never descended into.
+    local home_excludes=(
+      "${excludes[@]}"
+      -E '*history*' -E '*credentials*'
+    )
+    local exts=(conf toml yaml yml json jsonc lua ini cfg xml desktop service timer socket target path sh env editorconfig css rasi py nix fish zsh bash vim kdl ron properties list md txt)
+    local ext_args=()
+    local e
+    for e in "${exts[@]}"; do ext_args+=(-e "$e"); done
+    for dir in "${SEARCH_DIRS[@]}"; do
+      if [[ "$MODE" == "all" ]]; then
+        fd -L -H -t f -d "$MAXDEPTH" -S "$MAXSIZE" \
+          "${excludes[@]}" \
+          . "$dir" >> "$tmp" 2>/dev/null
+      else
+        # files with known extensions
+        fd -L -H -t f -d "$MAXDEPTH" -S "$MAXSIZE" \
+          "${ext_args[@]}" \
+          "${excludes[@]}" \
+          . "$dir" >> "$tmp" 2>/dev/null
+        # files with no extension (e.g. config, Makefile)
+        fd -L -H -t f -d "$MAXDEPTH" -S "$MAXSIZE" \
+          "${excludes[@]}" \
+          '^[^.]+$' "$dir" >> "$tmp" 2>/dev/null
+        # hidden dotfiles with no extension (e.g. .Xresources, .bashrc)
+        fd -L -H -t f -d "$MAXDEPTH" -S "$MAXSIZE" \
+          "${excludes[@]}" \
+          '^\.[^.]+$' "$dir" >> "$tmp" 2>/dev/null
+      fi
+    done
+    # Shallow $HOME scan (both modes)
+    if [[ "$MODE" == "all" ]]; then
+      fd -L -H -t f -d 1 -S "$MAXSIZE" \
+        "${home_excludes[@]}" \
+        . "$HOME" >> "$tmp" 2>/dev/null
+    else
+      fd -L -H -t f -d 1 -S "$MAXSIZE" \
+        "${ext_args[@]}" \
+        "${home_excludes[@]}" \
+        . "$HOME" >> "$tmp" 2>/dev/null
+      fd -L -H -t f -d 1 -S "$MAXSIZE" \
+        "${home_excludes[@]}" \
+        '^[^.]+$' "$HOME" >> "$tmp" 2>/dev/null
+      fd -L -H -t f -d 1 -S "$MAXSIZE" \
+        "${home_excludes[@]}" \
+        '^\.[^.]+$' "$HOME" >> "$tmp" 2>/dev/null
+    fi
+  else
+    # fd missing: config mode only (find fallback has no --all support)
+    if [[ "$MODE" == "all" ]]; then
+      echo "fd is required for --all mode" >&2
+      rm -f "$tmp"
+      exit 1
+    fi
+    local exts=(conf toml yaml yml json jsonc lua ini cfg xml desktop service timer socket target path sh env editorconfig css rasi py nix fish zsh bash vim kdl ron properties list md txt)
+    find -L "${SEARCH_DIRS[@]}" -maxdepth "$MAXDEPTH" -type f \
+      ! -path "*/.git/*" \
+      ! -path "*/node_modules/*" \
+      ! -path "*cache*" \
+      ! -path "*Cache*" \
+      ! -path "*/pnpm/*" \
+      ! -path "*/pipx/*" \
+      ! -path "*/uv/*" \
+      ! -path "*/Steam/*" \
+      ! -path "*/.steam/*" \
+      ! -path "*/__pycache__/*" \
+      ! -path "*/logs/*" \
+      ! -size +"${MAXSIZE#-}" \
+      \( $(printf -- '-name "*.%s" -o ' "${exts[@]}") -false \) \
+      2>/dev/null > "$tmp"
+    # add no-extension files (both visible and hidden dotfiles).
+    # [^/.]+ = basename without slash/dot so .*/ can't backtrack over dots.
+    find -L "${SEARCH_DIRS[@]}" -maxdepth "$MAXDEPTH" -type f \
+      ! -path "*/.git/*" \
+      ! -path "*/node_modules/*" \
+      ! -path "*cache*" \
+      ! -path "*Cache*" \
+      ! -path "*/pnpm/*" \
+      ! -path "*/pipx/*" \
+      ! -path "*/uv/*" \
+      ! -path "*/Steam/*" \
+      ! -path "*/.steam/*" \
+      ! -path "*/__pycache__/*" \
+      ! -path "*/logs/*" \
+      ! -size +"${MAXSIZE#-}" \
+      -regextype posix-extended \
+      -regex '.*/([^/.]+|\.[^/.]+)$' \
+      2>/dev/null >> "$tmp"
+    # Shallow $HOME top-level dotfiles (covers ~/.zshrc when fd is missing)
+    find -L "$HOME" -maxdepth 1 -type f \
+      ! -path "*history*" \
+      ! -path "*credentials*" \
+      ! -path "*cache*" \
+      ! -path "*Cache*" \
+      ! -size +"${MAXSIZE#-}" \
+      \( $(printf -- '-name "*.%s" -o ' "${exts[@]}") -false \) \
+      2>/dev/null >> "$tmp"
+    find -L "$HOME" -maxdepth 1 -type f \
+      ! -path "*history*" \
+      ! -path "*credentials*" \
+      ! -path "*cache*" \
+      ! -path "*Cache*" \
+      ! -size +"${MAXSIZE#-}" \
+      -regextype posix-extended \
+      -regex '.*/([^/.]+|\.[^/.]+)$' \
+      2>/dev/null >> "$tmp"
+  fi
+  sort -u "$tmp" -o "$tmp"
+  # Label paths once at build time (not on every open).
+  # [home] last: [cfg]/[local] lines no longer contain $HOME so are untouched.
+  sed -i \
+    -e "s|$HOME/.config/|[cfg] |" \
+    -e "s|$HOME/.local/share/|[local] |" \
+    -e "s|/etc/|[etc] |" \
+    -e "s|$HOME/|[home] |" \
+    "$tmp"
+  mv -f "$tmp" "$CACHE"
+  chmod 644 "$CACHE" 2>/dev/null || true
+}
+
+# If cache is gone, build it synchronously (first run / after wipe)
+if [[ ! -f "$CACHE" ]]; then
+  build_cache
+# If stale, refresh in background — next open gets fresh cache
+elif [[ -n $(find "$CACHE" -mmin +15 2>/dev/null) ]]; then
+  build_cache &
+fi
+
+# MRU-first display: fuzzel shows stdin order until you type,
+# so recents on top = "sorted by recent" on empty query.
+# Cost: 1-2 greps over ~16k lines + stat of ≤30 files (~10-30ms).
+list_file=$(mktemp)
+if [[ -s "$RECENT" ]]; then
+  {
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      grep -q -x -F "$line" "$CACHE" || continue
+      p=$(echo "$line" | sed \
+        -e "s|^\[cfg\] |$HOME/.config/|" \
+        -e "s|^\[local\] |$HOME/.local/share/|" \
+        -e "s|^\[etc\] |/etc/|" \
+        -e "s|^\[home\] |$HOME/|")
+      [[ -e "$p" ]] || continue
+      printf '%s\n' "$line"
+    done < <(head -n "$MAX_RECENT" "$RECENT")
+    grep -v -x -F -f <(head -n "$MAX_RECENT" "$RECENT") "$CACHE" || true
+  } > "$list_file"
+else
+  cat "$CACHE" > "$list_file"
+fi
+
+# Stream list straight into fuzzel — no bash variable (600ms slurp on 245k lines)
+selected=$(fuzzel --dmenu --prompt="$PROMPT" < "$list_file")
+rm -f "$list_file"
+[[ -z "$selected" ]] && exit 0
+
+full_path=$(echo "$selected" | sed \
+  -e "s|^\[cfg\] |$HOME/.config/|" \
+  -e "s|^\[local\] |$HOME/.local/share/|" \
+  -e "s|^\[etc\] |/etc/|" \
+  -e "s|^\[home\] |$HOME/|")
+
+if [[ ! -e "$full_path" ]]; then
+  echo "stale cache entry (deleted since index): $full_path" >&2
+  command -v notify-send &>/dev/null && notify-send "config-search" "File no longer exists: $full_path"
+  exit 1
+fi
+
+# Bump MRU (most-recent-first, capped). Tiny file — rewrite is ~1ms.
+tmp_r=$(mktemp)
+{
+  printf '%s\n' "$selected"
+  grep -v -x -F "$selected" "$RECENT" 2>/dev/null || true
+} | head -n "$MAX_RECENT" > "$tmp_r"
+mv -f "$tmp_r" "$RECENT"
+chmod 644 "$RECENT" 2>/dev/null || true
+
+nohup "$OPENER" "$full_path" >/dev/null 2>&1 &

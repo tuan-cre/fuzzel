@@ -1,0 +1,4 @@
+#!/bin/sh
+# SUDO_ASKPASS helper using fuzzel
+# Usage: SUDO_ASKPASS="$HOME/.config/fuzzel/askpass" sudo -A <cmd>
+exec fuzzel --dmenu --password --prompt-only --lines 0 --prompt "sudo: "
